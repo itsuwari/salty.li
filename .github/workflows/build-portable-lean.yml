@@ -19,13 +19,13 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Install packaging tools
         run: |
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y zstd zip
 
-      - name: Build portable tree
+      - name: Download and test full Lean
         run: |
           set -euxo pipefail
           root="$GITHUB_WORKSPACE/stage/lean-portable"
@@ -35,19 +35,11 @@ jobs:
             -o lean.tar.zst \
             "https://github.com/leanprover/lean4/releases/download/${LEAN_VERSION}/lean-${LEAN_VERSION#v}-linux.tar.zst"
           tar --zstd -xf lean.tar.zst
-          cp -a "lean-${LEAN_VERSION#v}-linux"/. "$root/toolchain/"
+          mv "lean-${LEAN_VERSION#v}-linux" "$root/toolchain"
+          rm lean.tar.zst
 
-          cd "$root/toolchain"
-          rm -rf share/doc share/man src lib/clang include/clang
-          rm -f bin/clang bin/clang++ bin/clang-cl bin/clang-cpp \
-            bin/ld.lld bin/lld bin/lld-link bin/wasm-ld
-          find lib/lean -type f \( \
-            -name '*.ilean' -o -name '*.c' -o -name '*.o' -o -name '*.bc' \
-          \) -delete || true
-          find . -type d -empty -delete || true
-          ./bin/lean --version
-          ./bin/lake --version
-
+          "$root/toolchain/bin/lean" --version
+          "$root/toolchain/bin/lake" --version
           cat > /tmp/Basic.lean <<'EOF'
           def add (a b : Nat) : Nat := a + b
 
@@ -57,21 +49,19 @@ jobs:
           def main : IO Unit :=
             IO.println s!"2 + 3 = {add 2 3}"
           EOF
-          ./bin/lean --run /tmp/Basic.lean | tee /tmp/basic.out
-          grep -Fx '2 + 3 = 5' /tmp/basic.out
+          "$root/toolchain/bin/lean" --run /tmp/Basic.lean | tee /tmp/basic-full.out
+          grep -Fx '2 + 3 = 5' /tmp/basic-full.out
 
+      - name: Fetch and test Mathlib cache
+        run: |
+          set -euxo pipefail
+          root="$GITHUB_WORKSPACE/stage/lean-portable"
           export PATH="$root/toolchain/bin:$PATH"
           cd "$root"
           git clone --depth 1 --branch "$LEAN_VERSION" \
             https://github.com/leanprover-community/mathlib4.git mathlib
           cd mathlib
           lake exe cache get
-          rm -rf .git .github docs scripts Archive Counterexamples MathlibTest test tests
-          find .lake -type d -name .git -prune -exec rm -rf '{}' + || true
-          find .lake -type f \( \
-            -name '*.ilean' -o -name '*.c' -o -name '*.o' -o -name '*.bc' -o -name '*.trace' \
-          \) -delete || true
-          find .lake -type d -empty -delete || true
 
           cat > PortableProbe.lean <<'EOF'
           import Mathlib.Tactic
@@ -83,8 +73,41 @@ jobs:
 
           def main : IO Unit := IO.println "mathlib-ok"
           EOF
-          lake env lean --run PortableProbe.lean | tee /tmp/mathlib.out
-          grep -Fx 'mathlib-ok' /tmp/mathlib.out
+          lake env lean --run PortableProbe.lean | tee /tmp/mathlib-full.out
+          grep -Fx 'mathlib-ok' /tmp/mathlib-full.out
+
+      - name: Trim, assemble, and retest
+        run: |
+          set -euxo pipefail
+          root="$GITHUB_WORKSPACE/stage/lean-portable"
+          export PATH="$root/toolchain/bin:$PATH"
+
+          cd "$root/mathlib"
+          rm -rf .git .github docs scripts Archive Counterexamples MathlibTest test tests
+          find .lake -type d -name .git -prune -exec rm -rf '{}' + || true
+          find .lake -type f \( \
+            -name '*.ilean' -o -name '*.c' -o -name '*.o' -o -name '*.bc' \
+            -o -name '*.a' -o -name '*.trace' \
+          \) -delete || true
+          find .lake -type d -empty -delete || true
+
+          cd "$root/toolchain"
+          rm -rf share/doc share/man src lib/clang include/clang
+          rm -f bin/clang bin/clang++ bin/clang-cl bin/clang-cpp \
+            bin/ld.lld bin/lld bin/lld-link bin/wasm-ld
+          find lib/lean -type f \( \
+            -name '*.ilean' -o -name '*.c' -o -name '*.o' -o -name '*.bc' \
+          \) -delete || true
+          find . -type d -empty -delete || true
+
+          ./bin/lean --version
+          ./bin/lake --version
+          ./bin/lean --run /tmp/Basic.lean | tee /tmp/basic-trimmed.out
+          grep -Fx '2 + 3 = 5' /tmp/basic-trimmed.out
+
+          cd "$root/mathlib"
+          lake env lean --run PortableProbe.lean | tee /tmp/mathlib-trimmed.out
+          grep -Fx 'mathlib-ok' /tmp/mathlib-trimmed.out
 
           mkdir -p "$root/bin" "$root/examples"
           cat > "$root/bin/lean" <<'EOF'
@@ -117,8 +140,10 @@ jobs:
           This relocatable bundle contains Lean 4.32.0 and the complete Mathlib
           v4.32.0 source tree. The build retains the largest coherent precompiled
           cache tier that fits a strict 470,000,000-byte ZIP budget. Generated
-          C/LLVM objects, `.ilean` metadata, documentation, and bundled Clang are
-          removed. Native `leanc` builds therefore require a system C/C++ toolchain.
+          C/LLVM objects, static package archives, `.ilean` metadata, documentation,
+          and bundled Clang are removed. Native `leanc` builds require a system
+          C/C++ toolchain. Lean elaboration, theorem checking, Lake, `lean --run`,
+          and the retained Mathlib cache are self-contained.
 
               ./bin/lean --run examples/Basic.lean
               ./bin/mathlib-lean --run ../examples/MathlibProbe.lean
@@ -142,10 +167,13 @@ jobs:
           target = int(os.environ['TARGET_ZIP_BYTES'])
           mathlib = root / 'mathlib'
 
-          def make_zip():
+          def make_zip() -> int:
               out.unlink(missing_ok=True)
-              subprocess.run(['zip', '-9', '-q', '-r', str(out), root.name],
-                             cwd=root.parent, check=True)
+              subprocess.run(
+                  ['zip', '-9', '-q', '-r', str(out), root.name],
+                  cwd=root.parent,
+                  check=True,
+              )
               size = out.stat().st_size
               print(f'ZIP size: {size} bytes')
               return size
@@ -162,8 +190,9 @@ jobs:
 
           if size >= target:
               packages = mathlib / '.lake' / 'packages'
-              for build in packages.glob('*/.lake/build') if packages.exists() else []:
-                  shutil.rmtree(build)
+              if packages.exists():
+                  for build in packages.glob('*/.lake/build'):
+                      shutil.rmtree(build)
               mode = 'complete Mathlib and dependency sources; caches omitted'
               size = make_zip()
 
@@ -172,16 +201,22 @@ jobs:
 
           report = root / 'BUILD-REPORT.txt'
           report.write_text(
-              f'Lean: v4.32.0\nMathlib: v4.32.0\n'
-              f'Mathlib cache mode: {mode}\nArchive bytes before report: {size}\n',
-              encoding='utf-8')
+              'Lean: v4.32.0\n'
+              'Mathlib: v4.32.0\n'
+              f'Mathlib cache mode: {mode}\n'
+              f'Archive bytes before report: {size}\n',
+              encoding='utf-8',
+          )
           size = make_zip()
           if size >= target:
               raise SystemExit(f'final archive {size} exceeds target {target}')
           report.write_text(
-              f'Lean: v4.32.0\nMathlib: v4.32.0\n'
-              f'Mathlib cache mode: {mode}\nArchive bytes: {size}\n',
-              encoding='utf-8')
+              'Lean: v4.32.0\n'
+              'Mathlib: v4.32.0\n'
+              f'Mathlib cache mode: {mode}\n'
+              f'Archive bytes: {size}\n',
+              encoding='utf-8',
+          )
           size = make_zip()
           if size >= target:
               raise SystemExit(f'final archive {size} exceeds target {target}')
@@ -193,6 +228,7 @@ jobs:
       - name: Verify extracted bundle
         run: |
           set -euxo pipefail
+          rm -rf verify
           mkdir verify
           unzip -q portable-lean-v4.32.0-x86_64-linux.zip -d verify
           verify/lean-portable/bin/lean --version
