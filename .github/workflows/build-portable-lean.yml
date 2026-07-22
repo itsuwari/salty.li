@@ -1,0 +1,215 @@
+name: Build portable Lean 4.32
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 210
+    env:
+      LEAN_VERSION: v4.32.0
+      TARGET_ZIP_BYTES: "470000000"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y zstd zip
+
+      - name: Build portable tree
+        run: |
+          set -euxo pipefail
+          root="$GITHUB_WORKSPACE/stage/lean-portable"
+          mkdir -p "$GITHUB_WORKSPACE/work" "$root"
+          cd "$GITHUB_WORKSPACE/work"
+          curl -fL --retry 5 --retry-delay 5 \
+            -o lean.tar.zst \
+            "https://github.com/leanprover/lean4/releases/download/${LEAN_VERSION}/lean-${LEAN_VERSION#v}-linux.tar.zst"
+          tar --zstd -xf lean.tar.zst
+          cp -a "lean-${LEAN_VERSION#v}-linux"/. "$root/toolchain/"
+
+          cd "$root/toolchain"
+          rm -rf share/doc share/man src lib/clang include/clang
+          rm -f bin/clang bin/clang++ bin/clang-cl bin/clang-cpp \
+            bin/ld.lld bin/lld bin/lld-link bin/wasm-ld
+          find lib/lean -type f \( \
+            -name '*.ilean' -o -name '*.c' -o -name '*.o' -o -name '*.bc' \
+          \) -delete || true
+          find . -type d -empty -delete || true
+          ./bin/lean --version
+          ./bin/lake --version
+
+          cat > /tmp/Basic.lean <<'EOF'
+          def add (a b : Nat) : Nat := a + b
+
+          theorem add_zero (n : Nat) : add n 0 = n := by
+            simp [add]
+
+          def main : IO Unit :=
+            IO.println s!"2 + 3 = {add 2 3}"
+          EOF
+          ./bin/lean --run /tmp/Basic.lean | tee /tmp/basic.out
+          grep -Fx '2 + 3 = 5' /tmp/basic.out
+
+          export PATH="$root/toolchain/bin:$PATH"
+          cd "$root"
+          git clone --depth 1 --branch "$LEAN_VERSION" \
+            https://github.com/leanprover-community/mathlib4.git mathlib
+          cd mathlib
+          lake exe cache get
+          rm -rf .git .github docs scripts Archive Counterexamples MathlibTest test tests
+          find .lake -type d -name .git -prune -exec rm -rf '{}' + || true
+          find .lake -type f \( \
+            -name '*.ilean' -o -name '*.c' -o -name '*.o' -o -name '*.bc' -o -name '*.trace' \
+          \) -delete || true
+          find .lake -type d -empty -delete || true
+
+          cat > PortableProbe.lean <<'EOF'
+          import Mathlib.Tactic
+          import Mathlib.Data.Real.Basic
+          import Mathlib.LinearAlgebra.Basic
+          import Mathlib.Analysis.Calculus.Deriv.Basic
+
+          example : (2 : Nat) + 3 = 5 := by norm_num
+
+          def main : IO Unit := IO.println "mathlib-ok"
+          EOF
+          lake env lean --run PortableProbe.lean | tee /tmp/mathlib.out
+          grep -Fx 'mathlib-ok' /tmp/mathlib.out
+
+          mkdir -p "$root/bin" "$root/examples"
+          cat > "$root/bin/lean" <<'EOF'
+          #!/usr/bin/env sh
+          set -eu
+          ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+          exec "$ROOT/toolchain/bin/lean" "$@"
+          EOF
+          cat > "$root/bin/lake" <<'EOF'
+          #!/usr/bin/env sh
+          set -eu
+          ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+          exec "$ROOT/toolchain/bin/lake" "$@"
+          EOF
+          cat > "$root/bin/mathlib-lean" <<'EOF'
+          #!/usr/bin/env sh
+          set -eu
+          ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+          cd "$ROOT/mathlib"
+          exec "$ROOT/toolchain/bin/lake" env lean "$@"
+          EOF
+          chmod +x "$root/bin/lean" "$root/bin/lake" "$root/bin/mathlib-lean"
+          cp /tmp/Basic.lean "$root/examples/Basic.lean"
+          cp PortableProbe.lean "$root/examples/MathlibProbe.lean"
+          rm PortableProbe.lean
+
+          cat > "$root/README.md" <<'EOF'
+          # Portable Lean 4.32.0 for x86-64 Linux
+
+          This relocatable bundle contains Lean 4.32.0 and the complete Mathlib
+          v4.32.0 source tree. The build retains the largest coherent precompiled
+          cache tier that fits a strict 470,000,000-byte ZIP budget. Generated
+          C/LLVM objects, `.ilean` metadata, documentation, and bundled Clang are
+          removed. Native `leanc` builds therefore require a system C/C++ toolchain.
+
+              ./bin/lean --run examples/Basic.lean
+              ./bin/mathlib-lean --run ../examples/MathlibProbe.lean
+          EOF
+
+          du -sh "$root/toolchain" "$root/mathlib" "$root/mathlib/.lake" || true
+
+      - name: Package under size cap
+        run: |
+          set -euxo pipefail
+          export ROOT="$GITHUB_WORKSPACE/stage/lean-portable"
+          export OUT="$GITHUB_WORKSPACE/portable-lean-v4.32.0-x86_64-linux.zip"
+          python3 - <<'PY'
+          import os
+          import shutil
+          import subprocess
+          from pathlib import Path
+
+          root = Path(os.environ['ROOT'])
+          out = Path(os.environ['OUT'])
+          target = int(os.environ['TARGET_ZIP_BYTES'])
+          mathlib = root / 'mathlib'
+
+          def make_zip():
+              out.unlink(missing_ok=True)
+              subprocess.run(['zip', '-9', '-q', '-r', str(out), root.name],
+                             cwd=root.parent, check=True)
+              size = out.stat().st_size
+              print(f'ZIP size: {size} bytes')
+              return size
+
+          mode = 'complete Mathlib precompiled cache'
+          size = make_zip()
+
+          if size >= target:
+              root_build = mathlib / '.lake' / 'build'
+              if root_build.exists():
+                  shutil.rmtree(root_build)
+              mode = 'complete Mathlib source with precompiled dependency packages'
+              size = make_zip()
+
+          if size >= target:
+              packages = mathlib / '.lake' / 'packages'
+              for build in packages.glob('*/.lake/build') if packages.exists() else []:
+                  shutil.rmtree(build)
+              mode = 'complete Mathlib and dependency sources; caches omitted'
+              size = make_zip()
+
+          if size >= target:
+              raise SystemExit(f'archive {size} exceeds target {target}')
+
+          report = root / 'BUILD-REPORT.txt'
+          report.write_text(
+              f'Lean: v4.32.0\nMathlib: v4.32.0\n'
+              f'Mathlib cache mode: {mode}\nArchive bytes before report: {size}\n',
+              encoding='utf-8')
+          size = make_zip()
+          if size >= target:
+              raise SystemExit(f'final archive {size} exceeds target {target}')
+          report.write_text(
+              f'Lean: v4.32.0\nMathlib: v4.32.0\n'
+              f'Mathlib cache mode: {mode}\nArchive bytes: {size}\n',
+              encoding='utf-8')
+          size = make_zip()
+          if size >= target:
+              raise SystemExit(f'final archive {size} exceeds target {target}')
+          print(report.read_text())
+          PY
+          sha256sum portable-lean-v4.32.0-x86_64-linux.zip | tee SHA256SUMS
+          stat -c '%n %s bytes' portable-lean-v4.32.0-x86_64-linux.zip
+
+      - name: Verify extracted bundle
+        run: |
+          set -euxo pipefail
+          mkdir verify
+          unzip -q portable-lean-v4.32.0-x86_64-linux.zip -d verify
+          verify/lean-portable/bin/lean --version
+          verify/lean-portable/bin/lean --run verify/lean-portable/examples/Basic.lean | tee /tmp/final-basic.out
+          grep -Fx '2 + 3 = 5' /tmp/final-basic.out
+          if [ -d verify/lean-portable/mathlib/.lake/build ]; then
+            (cd verify/lean-portable/mathlib && ../bin/mathlib-lean --run ../examples/MathlibProbe.lean) | tee /tmp/final-mathlib.out
+            grep -Fx 'mathlib-ok' /tmp/final-mathlib.out
+          fi
+
+      - name: Upload portable bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-lean-v4.32.0-x86_64-linux
+          path: |
+            portable-lean-v4.32.0-x86_64-linux.zip
+            SHA256SUMS
+            stage/lean-portable/BUILD-REPORT.txt
+          compression-level: 0
+          retention-days: 7
