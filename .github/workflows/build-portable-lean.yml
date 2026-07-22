@@ -153,6 +153,7 @@ jobs:
             bin/ld.lld bin/lld bin/lld-link bin/wasm-ld
           find lib/lean -type f \( \
             -name '*.ilean' -o -name '*.c' -o -name '*.o' -o -name '*.bc' \
+            -o -name '*.a' \
           \) -delete || true
           find . -type d -empty -delete || true
 
