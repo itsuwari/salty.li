@@ -84,8 +84,7 @@ jobs:
           export PATH="$root/toolchain/bin:$PATH"
 
           cd "$root/mathlib"
-          rm -rf .git .github docs scripts Archive Counterexamples MathlibTest test tests
-          find .lake -type d -name .git -prune -exec rm -rf '{}' + || true
+          rm -rf .github docs Archive Counterexamples MathlibTest test tests
           find .lake -type f \( \
             -name '*.ilean' -o -name '*.c' -o -name '*.o' -o -name '*.bc' \
             -o -name '*.a' -o -name '*.trace' \
@@ -142,9 +141,10 @@ jobs:
           v4.32.0 source tree. The build retains the largest coherent precompiled
           cache tier that fits a strict 470,000,000-byte ZIP budget. Generated
           C/LLVM objects, static package archives, `.ilean` metadata, documentation,
-          and bundled Clang are removed. Native `leanc` builds require a system
-          C/C++ toolchain. Lean elaboration, theorem checking, Lake, `lean --run`,
-          and the retained Mathlib cache are self-contained.
+          and bundled Clang are removed. Native `leanc` or cache rebuilding requires
+          a system C/C++ toolchain plus libc++, libc++abi, and libuv development
+          packages. Lean elaboration, theorem checking, Lake, `lean --run`, and the
+          retained Mathlib cache are self-contained.
 
               ./bin/lean --run examples/Basic.lean
               ./bin/mathlib-lean --run ../examples/MathlibProbe.lean
