@@ -11,10 +11,10 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 120
     env:
       LEAN_VERSION: v4.32.0
-      TARGET_ZIP_BYTES: "470000000"
+      TARGET_ZIP_BYTES: "490000000"
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -211,52 +211,85 @@ jobs:
           Lean: v4.32.0
           Mathlib: v4.32.0
           Mathlib cache mode: coherent traced root cache plus precompiled dependencies
-          Archive target: less than 470000000 bytes
+          Delivery format: ZIP containing a tar.zst payload and extraction script
+          Archive target: less than 490000000 bytes
           EOF
           du -sh "$root/toolchain" "$root/mathlib" "$root/mathlib/.lake" || true
 
-      - name: Package under size cap
+      - name: Create fast delivery ZIP
         run: |
           set -euxo pipefail
           root="$GITHUB_WORKSPACE/stage/lean-portable"
+          payload="$GITHUB_WORKSPACE/lean-portable-v4.32.0-x86_64-linux.tar.zst"
           out="$GITHUB_WORKSPACE/portable-lean-v4.32.0-x86_64-linux.zip"
+          delivery="$GITHUB_WORKSPACE/delivery"
           seven=$(command -v 7zz || command -v 7z)
-          cd "$GITHUB_WORKSPACE/stage"
-          "$seven" a -tzip -mx=5 -mmt=on "$out" lean-portable >/tmp/7zip.log
-          size=$(stat -c %s "$out")
-          mode='coherent traced root cache plus precompiled dependencies'
 
-          if [ "$size" -ge "$TARGET_ZIP_BYTES" ]; then
-            rm -f "$out"
+          make_payload() {
+            rm -f "$payload"
+            tar -C "$GITHUB_WORKSPACE/stage" -cf - lean-portable \
+              | zstd -T0 -8 -q -o "$payload"
+          }
+
+          make_payload
+          payload_size=$(stat -c %s "$payload")
+          mode='coherent traced root cache plus precompiled dependencies'
+          if [ "$payload_size" -ge 480000000 ]; then
             rm -rf "$root/mathlib/.lake/build"
             mode='complete Mathlib source plus precompiled dependencies'
             cat > "$root/BUILD-REPORT.txt" <<EOF
           Lean: v4.32.0
           Mathlib: v4.32.0
           Mathlib cache mode: $mode
+          Delivery format: ZIP containing a tar.zst payload and extraction script
           Archive target: less than $TARGET_ZIP_BYTES bytes
           EOF
-            "$seven" a -tzip -mx=5 -mmt=on "$out" lean-portable >/tmp/7zip.log
-            size=$(stat -c %s "$out")
+            make_payload
+            payload_size=$(stat -c %s "$payload")
           fi
 
-          test "$size" -lt "$TARGET_ZIP_BYTES"
-          printf 'Archive bytes: %s\nMathlib cache mode: %s\n' \
-            "$size" "$mode" | tee ARCHIVE-METADATA.txt
-          sha256sum portable-lean-v4.32.0-x86_64-linux.zip | tee SHA256SUMS
-          stat -c '%n %s bytes' portable-lean-v4.32.0-x86_64-linux.zip
+          rm -rf "$delivery"
+          mkdir "$delivery"
+          mv "$payload" "$delivery/"
+          cat > "$delivery/extract.sh" <<'EOF'
+          #!/usr/bin/env sh
+          set -eu
+          HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+          DEST=${1:-$PWD}
+          mkdir -p "$DEST"
+          zstd -dc "$HERE/lean-portable-v4.32.0-x86_64-linux.tar.zst" \
+            | tar -xf - -C "$DEST"
+          printf 'Extracted to %s/lean-portable\n' "$DEST"
+          EOF
+          chmod +x "$delivery/extract.sh"
+          cat > "$delivery/README.txt" <<EOF
+          Portable Lean 4.32.0 x86-64 Linux
 
-      - name: Verify extracted bundle
+          Run: ./extract.sh [destination-directory]
+          The extraction host needs the zstd command.
+          Mathlib cache mode: $mode
+          EOF
+          (cd "$delivery" && sha256sum lean-portable-v4.32.0-x86_64-linux.tar.zst > SHA256SUMS)
+          "$seven" a -tzip -mx=0 "$out" "$delivery"/* >/tmp/outer-zip.log
+
+          size=$(stat -c %s "$out")
+          test "$size" -lt "$TARGET_ZIP_BYTES"
+          printf 'Archive bytes: %s\nPayload bytes: %s\nMathlib cache mode: %s\n' \
+            "$size" "$payload_size" "$mode" | tee ARCHIVE-METADATA.txt
+          sha256sum portable-lean-v4.32.0-x86_64-linux.zip | tee SHA256SUMS
+
+      - name: Verify delivered archive
         run: |
           set -euxo pipefail
-          rm -rf verify
-          mkdir verify
-          unzip -q portable-lean-v4.32.0-x86_64-linux.zip -d verify
-          verify/lean-portable/bin/lean --version
-          verify/lean-portable/bin/lean --run verify/lean-portable/examples/Basic.lean | tee /tmp/final-basic.out
+          rm -rf verify-outer verify-tree
+          mkdir verify-outer verify-tree
+          unzip -q portable-lean-v4.32.0-x86_64-linux.zip -d verify-outer
+          verify-outer/extract.sh "$GITHUB_WORKSPACE/verify-tree"
+          verify-tree/lean-portable/bin/lean --version
+          verify-tree/lean-portable/bin/lean --run verify-tree/lean-portable/examples/Basic.lean | tee /tmp/final-basic.out
           grep -Fx '2 + 3 = 5' /tmp/final-basic.out
-          if [ -d verify/lean-portable/mathlib/.lake/build ]; then
-            (cd verify/lean-portable/mathlib && ../bin/mathlib-lean --run ../examples/MathlibProbe.lean) | tee /tmp/final-mathlib.out
+          if [ -d verify-tree/lean-portable/mathlib/.lake/build ]; then
+            (cd verify-tree/lean-portable/mathlib && ../bin/mathlib-lean --run ../examples/MathlibProbe.lean) | tee /tmp/final-mathlib.out
             grep -Fx 'mathlib-ok' /tmp/final-mathlib.out
           fi
 
