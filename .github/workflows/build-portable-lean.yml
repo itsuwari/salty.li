@@ -67,7 +67,7 @@ jobs:
           cat > PortableProbe.lean <<'EOF'
           import Mathlib.Tactic
           import Mathlib.Data.Real.Basic
-          import Mathlib.LinearAlgebra.Basic
+          import Mathlib.LinearAlgebra.Basis.Basic
           import Mathlib.Analysis.Calculus.Deriv.Basic
 
           example : (2 : Nat) + 3 = 5 := by norm_num
