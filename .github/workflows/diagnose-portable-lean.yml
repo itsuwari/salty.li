@@ -1,0 +1,77 @@
+name: Diagnose portable Lean build
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run diagnostics
+        id: diagnostic
+        continue-on-error: true
+        env:
+          LEAN_VERSION: v4.32.0
+        run: |
+          exec > >(tee "$GITHUB_WORKSPACE/diagnostic.log") 2>&1
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y zstd
+          mkdir -p work stage/toolchain
+          cd work
+          curl -fL --retry 5 --retry-delay 5 \
+            -o lean.tar.zst \
+            "https://github.com/leanprover/lean4/releases/download/${LEAN_VERSION}/lean-${LEAN_VERSION#v}-linux.tar.zst"
+          ls -lh lean.tar.zst
+          tar --zstd -xf lean.tar.zst
+          find . -maxdepth 2 -type d | sort | head -100
+          src="lean-${LEAN_VERSION#v}-linux"
+          test -d "$src"
+          cp -a "$src"/. ../stage/toolchain/
+          cd ../stage/toolchain
+          ./bin/lean --version
+          ./bin/lake --version
+          cat > /tmp/Basic.lean <<'EOF'
+          def add (a b : Nat) : Nat := a + b
+          theorem add_zero (n : Nat) : add n 0 = n := by simp [add]
+          def main : IO Unit := IO.println s!"2 + 3 = {add 2 3}"
+          EOF
+          ./bin/lean --run /tmp/Basic.lean
+          rm -rf share/doc share/man src lib/clang include/clang
+          rm -f bin/clang bin/clang++ bin/clang-cl bin/clang-cpp \
+            bin/ld.lld bin/lld bin/lld-link bin/wasm-ld
+          ./bin/lean --version
+          ./bin/lean --run /tmp/Basic.lean
+          find lib/lean -type f \( \
+            -name '*.ilean' -o -name '*.c' -o -name '*.o' -o -name '*.bc' \
+          \) -delete || true
+          ./bin/lean --version
+          ./bin/lean --run /tmp/Basic.lean
+          export PATH="$PWD/bin:$PATH"
+          cd ..
+          git clone --depth 1 --branch "$LEAN_VERSION" \
+            https://github.com/leanprover-community/mathlib4.git mathlib
+          cd mathlib
+          lake --version
+          lake exe cache get
+          echo DIAGNOSTIC_SUCCESS
+
+      - name: Upload diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-lean-diagnostic
+          path: diagnostic.log
+          retention-days: 7
+
+      - name: Propagate diagnostic failure
+        if: steps.diagnostic.outcome != 'success'
+        run: exit 1
