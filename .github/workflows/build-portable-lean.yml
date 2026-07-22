@@ -193,12 +193,12 @@ jobs:
           cat > "$root/README.md" <<'EOF'
           # Portable Lean 4.32.0 for x86-64 Linux
 
-          This relocatable bundle contains Lean 4.32.0, the complete Mathlib
-          v4.32.0 source tree, complete dependency source trees, precompiled
-          dependency packages, and a coherent traced subset of Mathlib's root
-          precompiled cache covering tactics, real numbers, linear algebra bases,
-          and basic differential calculus. Generated C/LLVM objects, static
-          archives, `.ilean` metadata, documentation, and bundled Clang are removed.
+          This relocatable bundle contains Lean 4.32.0 and the complete Mathlib
+          v4.32.0 source tree. It initially retains precompiled dependencies and a
+          coherent traced subset of Mathlib's root cache. If required by the strict
+          archive limit, precompiled caches are removed while complete sources are
+          preserved. Generated C/LLVM objects, static archives, `.ilean` metadata,
+          documentation, and bundled Clang are removed.
 
           Native `leanc` or cache rebuilding requires a system C/C++ toolchain plus
           libc++, libc++abi, and libuv development packages.
@@ -231,12 +231,7 @@ jobs:
               | zstd -T0 -8 -q -o "$payload"
           }
 
-          make_payload
-          payload_size=$(stat -c %s "$payload")
-          mode='coherent traced root cache plus precompiled dependencies'
-          if [ "$payload_size" -ge 480000000 ]; then
-            rm -rf "$root/mathlib/.lake/build"
-            mode='complete Mathlib source plus precompiled dependencies'
+          update_report() {
             cat > "$root/BUILD-REPORT.txt" <<EOF
           Lean: v4.32.0
           Mathlib: v4.32.0
@@ -244,10 +239,44 @@ jobs:
           Delivery format: ZIP containing a tar.zst payload and extraction script
           Archive target: less than $TARGET_ZIP_BYTES bytes
           EOF
+          }
+
+          mode='coherent traced root cache plus precompiled dependencies'
+          make_payload
+          payload_size=$(stat -c %s "$payload")
+
+          if [ "$payload_size" -ge 480000000 ]; then
+            rm -rf "$root/mathlib/.lake/build"
+            mode='complete Mathlib source plus precompiled dependencies'
+            update_report
             make_payload
             payload_size=$(stat -c %s "$payload")
           fi
 
+          if [ "$payload_size" -ge 480000000 ]; then
+            python3 - <<'PY'
+          import shutil
+          from pathlib import Path
+          packages = Path('stage/lean-portable/mathlib/.lake/packages')
+          if packages.exists():
+              for build in packages.glob('*/.lake/build'):
+                  shutil.rmtree(build)
+          PY
+            mode='complete Mathlib and dependency sources; precompiled caches omitted'
+            update_report
+            make_payload
+            payload_size=$(stat -c %s "$payload")
+          fi
+
+          if [ "$payload_size" -ge 480000000 ]; then
+            find "$root/mathlib" -type d -name .git -prune -exec rm -rf '{}' +
+            mode='complete Mathlib and dependency sources without Git metadata'
+            update_report
+            make_payload
+            payload_size=$(stat -c %s "$payload")
+          fi
+
+          test "$payload_size" -lt 480000000
           rm -rf "$delivery"
           mkdir "$delivery"
           mv "$payload" "$delivery/"
@@ -270,7 +299,7 @@ jobs:
           Mathlib cache mode: $mode
           EOF
           (cd "$delivery" && sha256sum lean-portable-v4.32.0-x86_64-linux.tar.zst > SHA256SUMS)
-          "$seven" a -tzip -mx=0 "$out" "$delivery"/* >/tmp/outer-zip.log
+          (cd "$delivery" && "$seven" a -tzip -mx=0 "$out" ./* >/tmp/outer-zip.log)
 
           size=$(stat -c %s "$out")
           test "$size" -lt "$TARGET_ZIP_BYTES"
